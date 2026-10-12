@@ -225,8 +225,8 @@ export default function Page() {
         <div className="template-options">
           <a
             href="/csdl_mau.xlsx"
+            download="csdl_mau.xlsx"
             className="template-link excel-btn"
-            target="_blank"
             rel="noopener noreferrer"
           >
             Tải File Excel
