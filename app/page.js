@@ -1,7 +1,7 @@
 // app/page.js
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import * as XLSX from "xlsx";
 
 // ----- Cấu hình cột dựa trên logic backend (Index 1 = Cột B) -----
@@ -16,6 +16,8 @@ const COL = {
 };
 const HEADER_ROWS = 2; // Bỏ qua 2 dòng tiêu đề
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const RELOAD_COOLDOWN_SECONDS = 20; // Thời gian chờ giữa 2 lần bấm nút tải lại
+const PREVIEW_WORDS = 5; // Số chữ đầu tiên của câu hỏi đầu tiên
 
 // Helper functions đồng bộ với Backend
 const fold = (t) =>
@@ -35,6 +37,30 @@ const parseLevel = (t) => {
 
 const isValidSheetLink = (link) =>
   /^https:\/\/docs\.google\.com\/spreadsheets\/d\/[a-zA-Z0-9_-]+/i.test(link);
+
+// Lấy N chữ đầu tiên của một đoạn văn bản
+const firstWords = (text, n = PREVIEW_WORDS) =>
+  (text || "")
+    .toString()
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, n)
+    .join(" ");
+
+// Chuyển giá trị thời gian (ISO string, timestamp, hoặc {seconds}) thành chuỗi hiển thị
+const formatTime = (value) => {
+  if (value === null || value === undefined || value === "") return "—";
+  let date;
+  if (typeof value === "object") {
+    const sec = value.seconds ?? value._seconds;
+    date = sec != null ? new Date(sec * 1000) : new Date(value);
+  } else {
+    date = new Date(value);
+  }
+  if (isNaN(date.getTime())) return "—";
+  return date.toLocaleString("vi-VN", { hour12: false });
+};
 
 const readFileAsArrayBuffer = (file) => {
   return new Promise((resolve, reject) => {
@@ -90,7 +116,57 @@ export default function Page() {
   const [result, setResult] = useState(null);
   const [copyText, setCopyText] = useState("Sao chép");
 
+  // ----- Bảng "các mã đã được tạo gần đây" -----
+  const [recent, setRecent] = useState([]);
+  const [isLoadingList, setIsLoadingList] = useState(true);
+  const [listError, setListError] = useState(null);
+  const [cooldown, setCooldown] = useState(0); // Số giây còn lại trước khi bấm tải lại được
+
   const fileInputRef = useRef(null);
+  const listRequestId = useRef(0); // Chỉ nhận kết quả của lần gọi mới nhất
+
+  // Tải 10 mã gần nhất từ server
+  const loadRecent = useCallback(async () => {
+    const requestId = ++listRequestId.current;
+    setIsLoadingList(true);
+    setListError(null);
+
+    try {
+      const res = await fetch("/api/save-puzzle", { cache: "no-store" });
+      const data = await res.json();
+      if (!res.ok)
+        throw new Error(data.error || `Lỗi server (mã ${res.status}).`);
+
+      const items = Array.isArray(data) ? data : data.items;
+      if (!Array.isArray(items))
+        throw new Error("Server trả về danh sách không hợp lệ.");
+
+      if (requestId === listRequestId.current) setRecent(items.slice(0, 10));
+    } catch (err) {
+      if (requestId === listRequestId.current)
+        setListError(err.message || "Không tải được danh sách mã.");
+    } finally {
+      if (requestId === listRequestId.current) setIsLoadingList(false);
+    }
+  }, []);
+
+  // Tự tải danh sách khi mở trang
+  useEffect(() => {
+    loadRecent();
+  }, [loadRecent]);
+
+  // Đếm ngược thời gian chờ của nút tải lại
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const timer = setTimeout(() => setCooldown((c) => c - 1), 1000);
+    return () => clearTimeout(timer);
+  }, [cooldown]);
+
+  const handleReloadClick = () => {
+    if (cooldown > 0 || isLoadingList) return;
+    setCooldown(RELOAD_COOLDOWN_SECONDS);
+    loadRecent();
+  };
 
   const handleUploadTypeChange = (e) => {
     setUploadType(e.target.value);
@@ -136,6 +212,9 @@ export default function Page() {
 
       // Set result dựa theo format response backend trả về
       setResult({ code: data.code, total: data.total });
+
+      // Cập nhật ngay bảng mã gần đây (không tính vào thời gian chờ của nút tải lại)
+      loadRecent();
     } catch (err) {
       throw err; // Ném lỗi ra ngoài để khối try...catch bên ngoài bắt
     } finally {
@@ -214,6 +293,13 @@ export default function Page() {
       setBtnText("Tạo Mã Dữ Liệu");
     }
   };
+
+  const reloadDisabled = cooldown > 0 || isLoadingList;
+  const reloadLabel = isLoadingList
+    ? "Đang tải..."
+    : cooldown > 0
+      ? `Tải lại (${cooldown}s)`
+      : "Tải lại";
 
   return (
     <div className="container">
@@ -351,6 +437,63 @@ export default function Page() {
           <div className="result-hint">(Hãy nhập mã này vào web game)</div>
         </div>
       )}
+
+      {/* ----- Bảng các mã đã được tạo gần đây ----- */}
+      <div className="recent-section">
+        <div className="recent-header">
+          <h2 className="recent-title">Các mã đã được tạo gần đây</h2>
+          <button
+            type="button"
+            className="reload-btn"
+            onClick={handleReloadClick}
+            disabled={reloadDisabled}
+          >
+            {reloadLabel}
+          </button>
+        </div>
+
+        {listError && (
+          <div className="error-box" role="alert" style={{ display: "block" }}>
+            {listError}
+          </div>
+        )}
+
+        <div className="table-scroll">
+          <table className="recent-table">
+            <thead>
+              <tr>
+                <th>STT</th>
+                <th>Tên mã</th>
+                <th>Thời gian tạo</th>
+                <th>Nội dung</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recent.length === 0 ? (
+                <tr>
+                  <td colSpan={4} className="recent-empty">
+                    {isLoadingList
+                      ? "Đang tải danh sách..."
+                      : "Chưa có mã nào."}
+                  </td>
+                </tr>
+              ) : (
+                recent.map((item, index) => {
+                  const preview = firstWords(item.preview);
+                  return (
+                    <tr key={item.code ?? index}>
+                      <td>{index + 1}</td>
+                      <td className="recent-code">{item.code}</td>
+                      <td>{formatTime(item.createdAt)}</td>
+                      <td>{preview ? `"${preview}..."` : "—"}</td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   );
 }

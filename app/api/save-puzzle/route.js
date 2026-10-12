@@ -4,6 +4,8 @@ import { adminDb } from "@/lib/firebase-admin";
 import { FieldValue } from "firebase-admin/firestore";
 
 export const runtime = "nodejs";
+// Không cache kết quả của GET (danh sách mã thay đổi liên tục)
+export const dynamic = "force-dynamic";
 
 const LEVELS = ["ez", "md", "hd"];
 const CODE_LENGTH = 6;
@@ -12,6 +14,11 @@ const MAX_BODY_BYTES = 1_000_000;
 const MAX_SHEET_BYTES = 5_000_000;
 const SHEET_TIMEOUT_MS = 4500;
 const MAX_QUESTIONS = 50;
+const RECENT_LIMIT = 10; // Số mã gần nhất trả về cho bảng
+const PREVIEW_WORDS = 5; // Số chữ đầu của câu hỏi đầu tiên
+
+// Tài liệu tổng hợp lưu 10 mã gần nhất: meta/recent -> { items: [...] }
+const recentRef = () => adminDb.collection("meta").doc("recent");
 
 class ApiError extends Error {
   constructor(status, message) {
@@ -20,17 +27,28 @@ class ApiError extends Error {
   }
 }
 
+function getClientIp(request) {
+  return request.headers.get("x-forwarded-for")?.split(",")[0] || "unknown";
+}
+
+function errorResponse(error) {
+  const status = error.status || 500;
+  const msg = error.status ? error.message : "Lỗi máy chủ nội bộ.";
+  console.error("API Error:", error);
+  return NextResponse.json({ error: msg }, { status });
+}
+
 // --- RATE LIMIT (In-memory, Best Effort) ---
 const rateBuckets = new Map();
-function checkRateLimit(ip) {
+function checkRateLimit(key) {
   const now = Date.now();
-  const bucket = rateBuckets.get(ip);
+  const bucket = rateBuckets.get(key);
   if (!bucket || bucket.resetAt <= now) {
-    rateBuckets.set(ip, { count: 1, resetAt: now + 60_000 });
+    rateBuckets.set(key, { count: 1, resetAt: now + 60_000 });
     return false;
   }
   bucket.count++;
-  return bucket.count > 15; // Tối đa 15 request / phút / IP
+  return bucket.count > 15; // Tối đa 15 request / phút / IP (mỗi loại POST/GET)
 }
 
 // --- GOOGLE SHEET FETCH (CÓ PROXY DỰ PHÒNG) ---
@@ -127,22 +145,46 @@ function buildBankFromSheet(table) {
   return bank;
 }
 
+// --- LẤY NỘI DUNG XEM TRƯỚC CHO BẢNG ---
+// Dữ liệu được lưu tách theo mức độ nên "câu hỏi đầu tiên" là câu đầu của
+// mức Dễ, nếu không có thì lấy mức Trung bình, rồi mức Khó.
+function getFirstQuestion(bank) {
+  for (const level of LEVELS) {
+    const q = bank?.[level]?.[0]?.q;
+    if (q) return String(q);
+  }
+  return "";
+}
+
+const firstWords = (text, n = PREVIEW_WORDS) =>
+  text.trim().split(/\s+/).filter(Boolean).slice(0, n).join(" ");
+
 // --- FIRESTORE TRANSACTION (ADMIN SDK) ---
 async function createPuzzleAdmin(bank) {
+  const preview = firstWords(getFirstQuestion(bank));
+
   for (let i = 0; i < 5; i++) {
     let code = "";
     for (let j = 0; j < CODE_LENGTH; j++)
       code += CODE_ALPHABET[randomInt(CODE_ALPHABET.length)];
 
     const ref = adminDb.collection("puzzles").doc(code);
+    const metaRef = recentRef();
     const created = await adminDb.runTransaction(async (t) => {
-      const doc = await t.get(ref);
+      // Firestore yêu cầu: đọc hết trước, ghi sau
+      const [doc, metaDoc] = await Promise.all([t.get(ref), t.get(metaRef)]);
       if (doc.exists) return false;
+
+      // serverTimestamp() không dùng được bên trong mảng nên dùng chuỗi ISO
+      const entry = { code, createdAt: new Date().toISOString(), preview };
+      const old = metaDoc.exists ? (metaDoc.data().items ?? []) : [];
+
       t.set(ref, {
         data: bank,
         createdAt: FieldValue.serverTimestamp(),
         views: 0,
       });
+      t.set(metaRef, { items: [entry, ...old].slice(0, RECENT_LIMIT) });
       return true;
     });
     if (created) return code;
@@ -150,12 +192,57 @@ async function createPuzzleAdmin(bank) {
   throw new ApiError(503, "Không thể tạo mã lúc này. Thử lại sau.");
 }
 
-// --- MAIN HANDLER ---
+// Chạy một lần duy nhất khi meta/recent chưa tồn tại (các mã tạo trước đây)
+async function backfillRecent() {
+  const snapshot = await adminDb
+    .collection("puzzles")
+    .orderBy("createdAt", "desc")
+    .limit(RECENT_LIMIT)
+    .get();
+
+  const items = snapshot.docs.map((doc) => {
+    const d = doc.data();
+    return {
+      code: doc.id,
+      createdAt: d.createdAt?.toDate?.().toISOString() ?? null,
+      preview: firstWords(getFirstQuestion(d.data)),
+    };
+  });
+
+  if (items.length > 0) {
+    try {
+      // create() báo lỗi nếu tài liệu đã có (vừa có mã mới tạo cùng lúc) -> bỏ qua
+      await recentRef().create({ items });
+    } catch (e) {}
+  }
+  return items;
+}
+
+// --- GET: DANH SÁCH MÃ GẦN ĐÂY ---
+export async function GET(request) {
+  try {
+    if (checkRateLimit(`list:${getClientIp(request)}`))
+      throw new ApiError(429, "Bạn thao tác quá nhanh, vui lòng chờ 1 phút.");
+
+    // Bình thường chỉ tốn 1 lượt đọc
+    const metaDoc = await recentRef().get();
+    const items = metaDoc.exists
+      ? (metaDoc.data().items ?? [])
+      : await backfillRecent();
+
+    return NextResponse.json(
+      { items },
+      { headers: { "Cache-Control": "no-store" } },
+    );
+  } catch (error) {
+    return errorResponse(error);
+  }
+}
+
+// --- POST: TẠO MÃ MỚI ---
 export async function POST(request) {
   try {
-    const ip =
-      request.headers.get("x-forwarded-for")?.split(",")[0] || "unknown";
-    if (checkRateLimit(ip))
+    if (checkRateLimit(`post:${getClientIp(request)}`))
       throw new ApiError(429, "Bạn thao tác quá nhanh, vui lòng chờ 1 phút.");
 
     const bodyLen = Number(request.headers.get("content-length"));
@@ -202,9 +289,6 @@ export async function POST(request) {
     const code = await createPuzzleAdmin(bank);
     return NextResponse.json({ success: true, code, total });
   } catch (error) {
-    const status = error.status || 500;
-    const msg = error.status ? error.message : "Lỗi máy chủ nội bộ.";
-    console.error("API Error:", error);
-    return NextResponse.json({ error: msg }, { status });
+    return errorResponse(error);
   }
 }
