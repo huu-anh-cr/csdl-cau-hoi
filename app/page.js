@@ -224,7 +224,7 @@ export default function Page() {
         <div className="step-title">1. Lấy Template (Mẫu)</div>
         <div className="template-options">
           <a
-            href="#"
+            href="/csdl_mau.xlsx"
             className="template-link excel-btn"
             target="_blank"
             rel="noopener noreferrer"
@@ -232,7 +232,7 @@ export default function Page() {
             Tải File Excel
           </a>
           <a
-            href="#"
+            href="https://docs.google.com/spreadsheets/d/1bBihWQ3_UlYFmROB8efOwtgNvEMdwq8_J9r8MiZvGIU/copy"
             className="template-link sheet-btn"
             target="_blank"
             rel="noopener noreferrer"
